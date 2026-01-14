@@ -57,6 +57,7 @@ pub const Regex = struct {
     literal_prefix_storage: [64]u8,
     literal_prefix_len: usize,
     case_insensitive: bool,
+    multiline: bool,
 
     /// Get the literal prefix slice (points to struct's own storage)
     pub fn getLiteralPrefix(self: *const Regex) ?[]const u8 {
@@ -229,16 +230,16 @@ const Compiler = struct {
         var anchored_start = false;
         var anchored_end = false;
 
-        // Check for ^ anchor at start
-        if (self.pos < self.pattern.len and self.pattern[self.pos] == '^') {
+        // Check for ^ anchor at start - but in multiline mode, let it be parsed as line_start
+        if (!self.options.multiline and self.pos < self.pattern.len and self.pattern[self.pos] == '^') {
             anchored_start = true;
             self.pos += 1;
         }
 
         const start_state = try self.parseExpr();
 
-        // Check for $ anchor at end
-        if (self.pos < self.pattern.len and self.pattern[self.pos] == '$') {
+        // Check for $ anchor at end - but in multiline mode, let it be parsed as line_end
+        if (!self.options.multiline and self.pos < self.pattern.len and self.pattern[self.pos] == '$') {
             anchored_end = true;
             self.pos += 1;
         }
@@ -274,6 +275,7 @@ const Compiler = struct {
             .literal_prefix_storage = literal_prefix_storage,
             .literal_prefix_len = literal_prefix_len,
             .case_insensitive = self.options.case_insensitive,
+            .multiline = self.options.multiline,
         };
     }
 
@@ -492,6 +494,14 @@ const Compiler = struct {
 
         while (self.pos < self.pattern.len and self.pattern[self.pos] != ']') {
             const start_char = self.pattern[self.pos];
+
+            // Check for POSIX character class [:classname:]
+            if (start_char == '[' and self.pos + 1 < self.pattern.len and self.pattern[self.pos + 1] == ':') {
+                if (try self.parsePosixClass(bitmap)) {
+                    continue;
+                }
+            }
+
             self.pos += 1;
 
             // Handle escape sequences in character class
@@ -571,6 +581,83 @@ const Compiler = struct {
             .out2 = State.NONE,
             .data = .{ .char_class = .{ .bitmap = bitmap, .negated = false } },
         });
+    }
+
+    /// Parse POSIX character class like [:alnum:], [:alpha:], etc.
+    /// Returns true if a POSIX class was parsed, false otherwise
+    fn parsePosixClass(self: *Compiler, bitmap: *simd.CharClass) Error!bool {
+        // Check for [:classname:] pattern
+        if (self.pos + 2 >= self.pattern.len) return false;
+        if (self.pattern[self.pos] != '[' or self.pattern[self.pos + 1] != ':') return false;
+
+        // Find the closing :]
+        var class_end: usize = self.pos + 2;
+        while (class_end + 1 < self.pattern.len) {
+            if (self.pattern[class_end] == ':' and self.pattern[class_end + 1] == ']') {
+                break;
+            }
+            class_end += 1;
+        }
+
+        if (class_end + 1 >= self.pattern.len) return false;
+
+        const class_name = self.pattern[self.pos + 2 .. class_end];
+
+        // Match POSIX class names and add appropriate characters
+        if (std.mem.eql(u8, class_name, "alnum")) {
+            bitmap.addRange('a', 'z');
+            bitmap.addRange('A', 'Z');
+            bitmap.addRange('0', '9');
+        } else if (std.mem.eql(u8, class_name, "alpha")) {
+            bitmap.addRange('a', 'z');
+            bitmap.addRange('A', 'Z');
+        } else if (std.mem.eql(u8, class_name, "digit")) {
+            bitmap.addRange('0', '9');
+        } else if (std.mem.eql(u8, class_name, "space")) {
+            bitmap.addChar(' ');
+            bitmap.addChar('\t');
+            bitmap.addChar('\n');
+            bitmap.addChar('\r');
+            bitmap.addChar(0x0B); // vertical tab
+            bitmap.addChar(0x0C); // form feed
+        } else if (std.mem.eql(u8, class_name, "lower")) {
+            bitmap.addRange('a', 'z');
+        } else if (std.mem.eql(u8, class_name, "upper")) {
+            bitmap.addRange('A', 'Z');
+        } else if (std.mem.eql(u8, class_name, "blank")) {
+            bitmap.addChar(' ');
+            bitmap.addChar('\t');
+        } else if (std.mem.eql(u8, class_name, "cntrl")) {
+            bitmap.addRange(0, 31);
+            bitmap.addChar(127);
+        } else if (std.mem.eql(u8, class_name, "graph")) {
+            bitmap.addRange('!', '~'); // 0x21-0x7E
+        } else if (std.mem.eql(u8, class_name, "print")) {
+            bitmap.addRange(' ', '~'); // 0x20-0x7E
+        } else if (std.mem.eql(u8, class_name, "punct")) {
+            // Punctuation: !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+            bitmap.addRange('!', '/'); // !"#$%&'()*+,-./
+            bitmap.addRange(':', '@'); // :;<=>?@
+            bitmap.addRange('[', '`'); // [\]^_`
+            bitmap.addRange('{', '~'); // {|}~
+        } else if (std.mem.eql(u8, class_name, "xdigit")) {
+            bitmap.addRange('0', '9');
+            bitmap.addRange('a', 'f');
+            bitmap.addRange('A', 'F');
+        } else if (std.mem.eql(u8, class_name, "word")) {
+            // GNU extension: equivalent to \w
+            bitmap.addRange('a', 'z');
+            bitmap.addRange('A', 'Z');
+            bitmap.addRange('0', '9');
+            bitmap.addChar('_');
+        } else {
+            // Unknown class name - treat as literal
+            return false;
+        }
+
+        // Advance past [:classname:]
+        self.pos = class_end + 2;
+        return true;
     }
 
     fn parseEscape(self: *Compiler) Error!u32 {
@@ -1240,4 +1327,154 @@ test "isRegexPattern" {
     try std.testing.expect(isRegexPattern("[a-z]+"));
     try std.testing.expect(isRegexPattern("a|b"));
     try std.testing.expect(isRegexPattern("\\d+"));
+}
+
+// ============================================================================
+// Multiline mode tests - ^ and $ should match at line boundaries
+// ============================================================================
+
+test "multiline: caret matches start of each line" {
+    var regex = try Regex.compile(std.testing.allocator, "^hello", .{ .multiline = true });
+    defer regex.deinit();
+
+    const text = "hello world\nhello there";
+    const matches = try regex.findAll(text, std.testing.allocator);
+    defer {
+        for (matches) |*m| m.deinit();
+        std.testing.allocator.free(matches);
+    }
+
+    // Should match "hello" at position 0 and position 12
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+}
+
+test "multiline: dollar matches end of each line" {
+    var regex = try Regex.compile(std.testing.allocator, "world$", .{ .multiline = true });
+    defer regex.deinit();
+
+    const text = "hello world\nthere world";
+    const matches = try regex.findAll(text, std.testing.allocator);
+    defer {
+        for (matches) |*m| m.deinit();
+        std.testing.allocator.free(matches);
+    }
+
+    // Should match "world" before each newline/end
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+}
+
+test "multiline: caret in middle of pattern" {
+    var regex = try Regex.compile(std.testing.allocator, "^\\w+ line", .{ .multiline = true });
+    defer regex.deinit();
+
+    const text = "first line\nsecond line\nthird line";
+    const matches = try regex.findAll(text, std.testing.allocator);
+    defer {
+        for (matches) |*m| m.deinit();
+        std.testing.allocator.free(matches);
+    }
+
+    // Should match at start of each line
+    try std.testing.expectEqual(@as(usize, 3), matches.len);
+}
+
+test "multiline: pattern starting with caret after newline" {
+    var regex = try Regex.compile(std.testing.allocator, "^error:", .{ .multiline = true });
+    defer regex.deinit();
+
+    const text = "error: something\nwarning: else\nerror: another";
+    const matches = try regex.findAll(text, std.testing.allocator);
+    defer {
+        for (matches) |*m| m.deinit();
+        std.testing.allocator.free(matches);
+    }
+
+    // Should match "error:" at lines 1 and 3
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+}
+
+// ============================================================================
+// POSIX character class tests
+// ============================================================================
+
+test "POSIX: alnum class" {
+    var regex = try Regex.compile(std.testing.allocator, "[[:alnum:]]+", .{});
+    defer regex.deinit();
+
+    const text = "abc123!@#";
+    var match = (try regex.find(text, std.testing.allocator)).?;
+    defer match.deinit();
+
+    try std.testing.expectEqualStrings("abc123", match.text(text));
+}
+
+test "POSIX: alpha class" {
+    var regex = try Regex.compile(std.testing.allocator, "[[:alpha:]]+", .{});
+    defer regex.deinit();
+
+    const text = "abc123def";
+    const matches = try regex.findAll(text, std.testing.allocator);
+    defer {
+        for (matches) |*m| m.deinit();
+        std.testing.allocator.free(matches);
+    }
+
+    // Should find "abc" and "def"
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+}
+
+test "POSIX: digit class" {
+    var regex = try Regex.compile(std.testing.allocator, "[[:digit:]]+", .{});
+    defer regex.deinit();
+
+    const text = "abc123def456";
+    const matches = try regex.findAll(text, std.testing.allocator);
+    defer {
+        for (matches) |*m| m.deinit();
+        std.testing.allocator.free(matches);
+    }
+
+    // Should find "123" and "456"
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+}
+
+test "POSIX: space class" {
+    var regex = try Regex.compile(std.testing.allocator, "[[:space:]]+", .{});
+    defer regex.deinit();
+
+    const text = "hello world\ttab\nnewline";
+    const matches = try regex.findAll(text, std.testing.allocator);
+    defer {
+        for (matches) |*m| m.deinit();
+        std.testing.allocator.free(matches);
+    }
+
+    // Should find space, tab, and newline
+    try std.testing.expectEqual(@as(usize, 3), matches.len);
+}
+
+test "POSIX: lower class" {
+    var regex = try Regex.compile(std.testing.allocator, "[[:lower:]]+", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("abc"));
+    try std.testing.expect(!regex.isMatch("ABC"));
+    try std.testing.expect(!regex.isMatch("123"));
+}
+
+test "POSIX: upper class" {
+    var regex = try Regex.compile(std.testing.allocator, "[[:upper:]]+", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("ABC"));
+    try std.testing.expect(!regex.isMatch("abc"));
+    try std.testing.expect(!regex.isMatch("123"));
+}
+
+test "POSIX: combined with other chars in class" {
+    var regex = try Regex.compile(std.testing.allocator, "[[:alpha:]_]+", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("hello_world"));
+    try std.testing.expect(regex.isMatch("_underscore"));
 }
