@@ -1,0 +1,12 @@
+.{
+    .fingerprint = 0xee699fc0b12a1d7b,
+    .name = .e_jerk_regex,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{},
+}

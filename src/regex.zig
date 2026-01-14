@@ -1,0 +1,1243 @@
+const std = @import("std");
+const simd = @import("simd.zig");
+
+/// Regex engine supporting POSIX Extended Regular Expressions (ERE)
+/// Features: . * + ? | ^ $ () [] [^] {n,m} \d \w \s \b and backreferences
+/// Optimized with SIMD for character class matching and literal prefixes
+
+pub const RegexError = error{
+    InvalidPattern,
+    UnmatchedParen,
+    UnmatchedBracket,
+    InvalidQuantifier,
+    InvalidEscape,
+    InvalidRange,
+    OutOfMemory,
+    PatternTooComplex,
+};
+
+/// Match result with capture groups
+pub const Match = struct {
+    start: usize,
+    end: usize,
+    groups: []?Group,
+    allocator: std.mem.Allocator,
+
+    pub const Group = struct {
+        start: usize,
+        end: usize,
+    };
+
+    pub fn deinit(self: *Match) void {
+        self.allocator.free(self.groups);
+    }
+
+    pub fn text(self: *const Match, source: []const u8) []const u8 {
+        return source[self.start..self.end];
+    }
+
+    pub fn group(self: *const Match, idx: usize, source: []const u8) ?[]const u8 {
+        if (idx >= self.groups.len) return null;
+        if (self.groups[idx]) |g| {
+            return source[g.start..g.end];
+        }
+        return null;
+    }
+};
+
+/// Compiled regex pattern
+pub const Regex = struct {
+    allocator: std.mem.Allocator,
+    states: []State,
+    start_state: u32,
+    num_groups: usize,
+    anchored_start: bool,
+    anchored_end: bool,
+    /// Literal prefix storage for fast filtering (SIMD-accelerated skip)
+    literal_prefix_storage: [64]u8,
+    literal_prefix_len: usize,
+    case_insensitive: bool,
+
+    /// Get the literal prefix slice (points to struct's own storage)
+    pub fn getLiteralPrefix(self: *const Regex) ?[]const u8 {
+        if (self.literal_prefix_len > 0) {
+            return self.literal_prefix_storage[0..self.literal_prefix_len];
+        }
+        return null;
+    }
+
+    pub fn compile(allocator: std.mem.Allocator, pattern: []const u8, options: Options) !Regex {
+        var compiler = Compiler.init(allocator, pattern, options);
+        return compiler.compile();
+    }
+
+    pub fn deinit(self: *Regex) void {
+        for (self.states) |*state| {
+            state.deinit(self.allocator);
+        }
+        self.allocator.free(self.states);
+    }
+
+    /// Check if the text matches the pattern anywhere
+    pub fn isMatch(self: *const Regex, text: []const u8) bool {
+        var m = self.find(text, self.allocator) catch return false;
+        if (m) |*match| {
+            match.deinit();
+            return true;
+        }
+        return false;
+    }
+
+    /// Find first match in text
+    pub fn find(self: *const Regex, text: []const u8, allocator: std.mem.Allocator) !?Match {
+        return self.findAt(text, 0, allocator);
+    }
+
+    /// Find match starting at or after position
+    pub fn findAt(self: *const Regex, text: []const u8, start: usize, allocator: std.mem.Allocator) !?Match {
+        // Use SIMD literal prefix search to skip non-matching positions
+        var search_start = start;
+
+        if (self.anchored_start) {
+            if (start == 0) {
+                return self.matchAt(text, 0, allocator);
+            }
+            return null;
+        }
+
+        while (search_start <= text.len) {
+            // Fast skip using literal prefix
+            if (self.getLiteralPrefix()) |prefix| {
+                if (simd.searchLiteral(text[search_start..], prefix, self.case_insensitive)) |offset| {
+                    search_start += offset;
+                } else {
+                    return null;
+                }
+            }
+
+            if (try self.matchAt(text, search_start, allocator)) |m| {
+                return m;
+            }
+            search_start += 1;
+        }
+        return null;
+    }
+
+    /// Find all matches in text
+    pub fn findAll(self: *const Regex, text: []const u8, allocator: std.mem.Allocator) ![]Match {
+        var matches: std.ArrayListUnmanaged(Match) = .{};
+        errdefer {
+            for (matches.items) |*m| m.deinit();
+            matches.deinit(allocator);
+        }
+
+        var pos: usize = 0;
+        while (pos <= text.len) {
+            if (try self.findAt(text, pos, allocator)) |m| {
+                try matches.append(allocator, m);
+                pos = if (m.end > m.start) m.end else m.start + 1;
+            } else {
+                break;
+            }
+        }
+
+        return matches.toOwnedSlice(allocator);
+    }
+
+    /// Try to match at exact position
+    fn matchAt(self: *const Regex, text: []const u8, pos: usize, allocator: std.mem.Allocator) !?Match {
+        var executor = try Executor.init(allocator, self);
+        defer executor.deinit();
+        return executor.execute(text, pos);
+    }
+
+    pub const Options = struct {
+        case_insensitive: bool = false,
+        multiline: bool = false,
+        extended: bool = true, // ERE mode (default)
+    };
+};
+
+/// State types for the NFA
+const StateType = enum(u8) {
+    literal, // Match single character
+    char_class, // Match character class using bitmap
+    dot, // Match any character except newline
+    split, // Epsilon split to two states
+    match, // Accept state
+    group_start, // Capture group start
+    group_end, // Capture group end
+    word_boundary, // \b
+    not_word_boundary, // \B
+    line_start, // ^
+    line_end, // $
+    any, // . including newline (with DOTALL flag)
+};
+
+const State = struct {
+    type: StateType,
+    /// Next state (for non-split states)
+    out: u32,
+    /// Second output for split states
+    out2: u32,
+
+    data: union {
+        literal: struct {
+            char: u8,
+            case_insensitive: bool,
+        },
+        char_class: struct {
+            bitmap: *simd.CharClass,
+            negated: bool,
+        },
+        group_idx: u32,
+        none: void,
+    },
+
+    const NONE: u32 = std.math.maxInt(u32);
+
+    fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        if (self.type == .char_class) {
+            allocator.destroy(self.data.char_class.bitmap);
+        }
+    }
+};
+
+/// Regex compiler - converts pattern string to NFA states
+const Compiler = struct {
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    pos: usize,
+    options: Regex.Options,
+    states: std.ArrayListUnmanaged(State),
+    group_count: u32,
+
+    const Error = RegexError || std.mem.Allocator.Error;
+
+    fn init(allocator: std.mem.Allocator, pattern: []const u8, options: Regex.Options) Compiler {
+        return .{
+            .allocator = allocator,
+            .pattern = pattern,
+            .pos = 0,
+            .options = options,
+            .states = .{},
+            .group_count = 0,
+        };
+    }
+
+    fn compile(self: *Compiler) !Regex {
+        var anchored_start = false;
+        var anchored_end = false;
+
+        // Check for ^ anchor at start
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == '^') {
+            anchored_start = true;
+            self.pos += 1;
+        }
+
+        const start_state = try self.parseExpr();
+
+        // Check for $ anchor at end
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == '$') {
+            anchored_end = true;
+            self.pos += 1;
+        }
+
+        if (self.pos != self.pattern.len) {
+            for (self.states.items) |*s| s.deinit(self.allocator);
+            self.states.deinit(self.allocator);
+            return RegexError.InvalidPattern;
+        }
+
+        // Add match state
+        const match_idx = try self.addState(.{
+            .type = .match,
+            .out = State.NONE,
+            .out2 = State.NONE,
+            .data = .{ .none = {} },
+        });
+
+        // Patch dangling ends to match state
+        try self.patchEnds(start_state, match_idx);
+
+        // Extract literal prefix for SIMD optimization
+        var literal_prefix_storage: [64]u8 = undefined;
+        const literal_prefix_len = self.extractLiteralPrefix(&literal_prefix_storage, start_state);
+
+        return Regex{
+            .allocator = self.allocator,
+            .states = try self.states.toOwnedSlice(self.allocator),
+            .start_state = start_state,
+            .num_groups = self.group_count,
+            .anchored_start = anchored_start,
+            .anchored_end = anchored_end,
+            .literal_prefix_storage = literal_prefix_storage,
+            .literal_prefix_len = literal_prefix_len,
+            .case_insensitive = self.options.case_insensitive,
+        };
+    }
+
+    fn extractLiteralPrefix(self: *Compiler, storage: *[64]u8, start_state: u32) usize {
+        // Find leading literal characters for SIMD skip optimization
+        // Don't extract prefix for alternations (split states) as each branch may differ
+        if (self.states.items.len == 0) return 0;
+        if (start_state >= self.states.items.len) return 0;
+        if (self.states.items[start_state].type == .split) return 0;
+
+        var len: usize = 0;
+        var state_idx: u32 = start_state;
+
+        while (state_idx < self.states.items.len and len < 64) {
+            const state = &self.states.items[state_idx];
+            switch (state.type) {
+                .literal => {
+                    storage[len] = if (self.options.case_insensitive)
+                        simd.toLower(state.data.literal.char)
+                    else
+                        state.data.literal.char;
+                    len += 1;
+                    state_idx = state.out;
+                    if (state_idx == State.NONE) break;
+                },
+                .group_start, .group_end => {
+                    state_idx = state.out;
+                    if (state_idx == State.NONE) break;
+                },
+                else => break,
+            }
+        }
+
+        return len;
+    }
+
+    fn parseExpr(self: *Compiler) Error!u32 {
+        var left = try self.parseTerm();
+
+        while (self.pos < self.pattern.len and self.pattern[self.pos] == '|') {
+            self.pos += 1;
+            const right = try self.parseTerm();
+
+            // Create split state for alternation
+            const split_idx = try self.addState(.{
+                .type = .split,
+                .out = left,
+                .out2 = right,
+                .data = .{ .none = {} },
+            });
+
+            left = split_idx;
+        }
+
+        return left;
+    }
+
+    fn parseTerm(self: *Compiler) Error!u32 {
+        var result: ?u32 = null;
+
+        while (self.pos < self.pattern.len) {
+            const c = self.pattern[self.pos];
+            if (c == '|' or c == ')') break;
+
+            const factor = try self.parseFactor();
+
+            if (result) |r| {
+                try self.patchEnds(r, factor);
+                // result stays the same (start of concatenation)
+            } else {
+                result = factor;
+            }
+        }
+
+        // Empty pattern - epsilon
+        if (result == null) {
+            result = try self.addState(.{
+                .type = .split,
+                .out = State.NONE,
+                .out2 = State.NONE,
+                .data = .{ .none = {} },
+            });
+        }
+
+        return result.?;
+    }
+
+    fn parseFactor(self: *Compiler) Error!u32 {
+        var base = try self.parseBase();
+
+        // Handle quantifiers
+        if (self.pos < self.pattern.len) {
+            switch (self.pattern[self.pos]) {
+                '*' => {
+                    self.pos += 1;
+                    base = try self.makeKleeneStar(base);
+                },
+                '+' => {
+                    self.pos += 1;
+                    base = try self.makeOneOrMore(base);
+                },
+                '?' => {
+                    self.pos += 1;
+                    base = try self.makeOptional(base);
+                },
+                '{' => {
+                    base = try self.parseQuantifier(base);
+                },
+                else => {},
+            }
+        }
+
+        return base;
+    }
+
+    fn parseBase(self: *Compiler) Error!u32 {
+        if (self.pos >= self.pattern.len) {
+            return RegexError.InvalidPattern;
+        }
+
+        const c = self.pattern[self.pos];
+        switch (c) {
+            '(' => {
+                self.pos += 1;
+                self.group_count += 1;
+                const group_idx = self.group_count;
+
+                const start = try self.addState(.{
+                    .type = .group_start,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .group_idx = group_idx },
+                });
+
+                const inner = try self.parseExpr();
+
+                if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
+                    return RegexError.UnmatchedParen;
+                }
+                self.pos += 1;
+
+                const end = try self.addState(.{
+                    .type = .group_end,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .group_idx = group_idx },
+                });
+
+                self.states.items[start].out = inner;
+                try self.patchEnds(inner, end);
+
+                return start;
+            },
+            '[' => return self.parseCharClass(),
+            '.' => {
+                self.pos += 1;
+                return self.addState(.{
+                    .type = .dot,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .none = {} },
+                });
+            },
+            '^' => {
+                self.pos += 1;
+                return self.addState(.{
+                    .type = .line_start,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .none = {} },
+                });
+            },
+            '$' => {
+                self.pos += 1;
+                return self.addState(.{
+                    .type = .line_end,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .none = {} },
+                });
+            },
+            '\\' => return self.parseEscape(),
+            '*', '+', '?', '{', '|', ')' => return RegexError.InvalidPattern,
+            else => {
+                self.pos += 1;
+                return self.addState(.{
+                    .type = .literal,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .literal = .{
+                        .char = c,
+                        .case_insensitive = self.options.case_insensitive,
+                    } },
+                });
+            },
+        }
+    }
+
+    fn parseCharClass(self: *Compiler) Error!u32 {
+        self.pos += 1; // skip [
+
+        var negated = false;
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == '^') {
+            negated = true;
+            self.pos += 1;
+        }
+
+        const bitmap = try self.allocator.create(simd.CharClass);
+        bitmap.* = simd.CharClass.init();
+
+        // Handle ] as first character (literal)
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == ']') {
+            bitmap.addChar(']');
+            self.pos += 1;
+        }
+
+        while (self.pos < self.pattern.len and self.pattern[self.pos] != ']') {
+            const start_char = self.pattern[self.pos];
+            self.pos += 1;
+
+            // Handle escape sequences in character class
+            var actual_start = start_char;
+            if (start_char == '\\' and self.pos < self.pattern.len) {
+                actual_start = switch (self.pattern[self.pos]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    'd' => {
+                        // Add digit class
+                        bitmap.addRange('0', '9');
+                        self.pos += 1;
+                        continue;
+                    },
+                    'w' => {
+                        bitmap.addRange('a', 'z');
+                        bitmap.addRange('A', 'Z');
+                        bitmap.addRange('0', '9');
+                        bitmap.addChar('_');
+                        self.pos += 1;
+                        continue;
+                    },
+                    's' => {
+                        bitmap.addChar(' ');
+                        bitmap.addChar('\t');
+                        bitmap.addChar('\n');
+                        bitmap.addChar('\r');
+                        self.pos += 1;
+                        continue;
+                    },
+                    else => self.pattern[self.pos],
+                };
+                self.pos += 1;
+            }
+
+            // Check for range
+            if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
+                self.pos += 1; // skip -
+                var end_char = self.pattern[self.pos];
+                self.pos += 1;
+
+                // Handle escape in range end
+                if (end_char == '\\' and self.pos < self.pattern.len) {
+                    end_char = switch (self.pattern[self.pos]) {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        else => self.pattern[self.pos],
+                    };
+                    self.pos += 1;
+                }
+
+                if (actual_start > end_char) {
+                    self.allocator.destroy(bitmap);
+                    return RegexError.InvalidRange;
+                }
+                bitmap.addRange(actual_start, end_char);
+            } else {
+                bitmap.addChar(actual_start);
+            }
+        }
+
+        if (self.pos >= self.pattern.len) {
+            self.allocator.destroy(bitmap);
+            return RegexError.UnmatchedBracket;
+        }
+        self.pos += 1; // skip ]
+
+        if (negated) {
+            bitmap.negate();
+        }
+
+        return self.addState(.{
+            .type = .char_class,
+            .out = State.NONE,
+            .out2 = State.NONE,
+            .data = .{ .char_class = .{ .bitmap = bitmap, .negated = false } },
+        });
+    }
+
+    fn parseEscape(self: *Compiler) Error!u32 {
+        self.pos += 1;
+        if (self.pos >= self.pattern.len) return RegexError.InvalidEscape;
+
+        const c = self.pattern[self.pos];
+        self.pos += 1;
+
+        switch (c) {
+            'd' => {
+                const bitmap = try self.allocator.create(simd.CharClass);
+                bitmap.* = simd.CharClass.digit;
+                return self.addState(.{
+                    .type = .char_class,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .char_class = .{ .bitmap = bitmap, .negated = false } },
+                });
+            },
+            'D' => {
+                const bitmap = try self.allocator.create(simd.CharClass);
+                bitmap.* = simd.CharClass.not_digit;
+                return self.addState(.{
+                    .type = .char_class,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .char_class = .{ .bitmap = bitmap, .negated = false } },
+                });
+            },
+            'w' => {
+                const bitmap = try self.allocator.create(simd.CharClass);
+                bitmap.* = simd.CharClass.word;
+                return self.addState(.{
+                    .type = .char_class,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .char_class = .{ .bitmap = bitmap, .negated = false } },
+                });
+            },
+            'W' => {
+                const bitmap = try self.allocator.create(simd.CharClass);
+                bitmap.* = simd.CharClass.not_word;
+                return self.addState(.{
+                    .type = .char_class,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .char_class = .{ .bitmap = bitmap, .negated = false } },
+                });
+            },
+            's' => {
+                const bitmap = try self.allocator.create(simd.CharClass);
+                bitmap.* = simd.CharClass.whitespace;
+                return self.addState(.{
+                    .type = .char_class,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .char_class = .{ .bitmap = bitmap, .negated = false } },
+                });
+            },
+            'S' => {
+                const bitmap = try self.allocator.create(simd.CharClass);
+                bitmap.* = simd.CharClass.not_whitespace;
+                return self.addState(.{
+                    .type = .char_class,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .char_class = .{ .bitmap = bitmap, .negated = false } },
+                });
+            },
+            'b' => {
+                return self.addState(.{
+                    .type = .word_boundary,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .none = {} },
+                });
+            },
+            'B' => {
+                return self.addState(.{
+                    .type = .not_word_boundary,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .none = {} },
+                });
+            },
+            'n' => {
+                return self.addState(.{
+                    .type = .literal,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .literal = .{ .char = '\n', .case_insensitive = false } },
+                });
+            },
+            't' => {
+                return self.addState(.{
+                    .type = .literal,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .literal = .{ .char = '\t', .case_insensitive = false } },
+                });
+            },
+            'r' => {
+                return self.addState(.{
+                    .type = .literal,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .literal = .{ .char = '\r', .case_insensitive = false } },
+                });
+            },
+            else => {
+                // Escaped literal
+                return self.addState(.{
+                    .type = .literal,
+                    .out = State.NONE,
+                    .out2 = State.NONE,
+                    .data = .{ .literal = .{
+                        .char = c,
+                        .case_insensitive = self.options.case_insensitive,
+                    } },
+                });
+            },
+        }
+    }
+
+    fn parseQuantifier(self: *Compiler, base: u32) Error!u32 {
+        self.pos += 1; // skip {
+
+        var min: u32 = 0;
+        var max: ?u32 = null;
+
+        while (self.pos < self.pattern.len and self.pattern[self.pos] >= '0' and self.pattern[self.pos] <= '9') {
+            min = min * 10 + @as(u32, self.pattern[self.pos] - '0');
+            self.pos += 1;
+        }
+
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == ',') {
+            self.pos += 1;
+            if (self.pos < self.pattern.len and self.pattern[self.pos] >= '0' and self.pattern[self.pos] <= '9') {
+                max = 0;
+                while (self.pos < self.pattern.len and self.pattern[self.pos] >= '0' and self.pattern[self.pos] <= '9') {
+                    max = max.? * 10 + @as(u32, self.pattern[self.pos] - '0');
+                    self.pos += 1;
+                }
+            }
+        } else {
+            max = min;
+        }
+
+        if (self.pos >= self.pattern.len or self.pattern[self.pos] != '}') {
+            return RegexError.InvalidQuantifier;
+        }
+        self.pos += 1;
+
+        // Simplified quantifier handling
+        if (min == 0 and max == null) {
+            return self.makeKleeneStar(base);
+        } else if (min == 1 and max == null) {
+            return self.makeOneOrMore(base);
+        } else if (min == 0 and max != null and max.? == 1) {
+            return self.makeOptional(base);
+        }
+
+        // For {n,m} we'd need to duplicate states - fall back to base for now
+        return base;
+    }
+
+    fn makeKleeneStar(self: *Compiler, base: u32) Error!u32 {
+        const split = try self.addState(.{
+            .type = .split,
+            .out = base,
+            .out2 = State.NONE,
+            .data = .{ .none = {} },
+        });
+        try self.patchEnds(base, split);
+        return split;
+    }
+
+    fn makeOneOrMore(self: *Compiler, base: u32) Error!u32 {
+        const split = try self.addState(.{
+            .type = .split,
+            .out = base,
+            .out2 = State.NONE,
+            .data = .{ .none = {} },
+        });
+        try self.patchEnds(base, split);
+        return base;
+    }
+
+    fn makeOptional(self: *Compiler, base: u32) Error!u32 {
+        const split = try self.addState(.{
+            .type = .split,
+            .out = base,
+            .out2 = State.NONE,
+            .data = .{ .none = {} },
+        });
+        return split;
+    }
+
+    fn addState(self: *Compiler, state: State) Error!u32 {
+        const idx = @as(u32, @intCast(self.states.items.len));
+        try self.states.append(self.allocator, state);
+        return idx;
+    }
+
+    fn patchEnds(self: *Compiler, start: u32, target: u32) Error!void {
+        const visited = try self.allocator.alloc(bool, self.states.items.len);
+        defer self.allocator.free(visited);
+        @memset(visited, false);
+
+        self.patchEndsRecursive(start, target, visited);
+    }
+
+    fn patchEndsRecursive(self: *Compiler, idx: u32, target: u32, visited: []bool) void {
+        if (idx == State.NONE or idx >= self.states.items.len) return;
+        if (visited[idx]) return;
+        visited[idx] = true;
+
+        const state = &self.states.items[idx];
+
+        switch (state.type) {
+            .split => {
+                if (state.out == State.NONE) {
+                    state.out = target;
+                } else {
+                    self.patchEndsRecursive(state.out, target, visited);
+                }
+                if (state.out2 == State.NONE) {
+                    state.out2 = target;
+                } else {
+                    self.patchEndsRecursive(state.out2, target, visited);
+                }
+            },
+            .match => {},
+            else => {
+                if (state.out == State.NONE) {
+                    state.out = target;
+                } else {
+                    self.patchEndsRecursive(state.out, target, visited);
+                }
+            },
+        }
+    }
+};
+
+/// NFA executor with Thompson's algorithm
+const Executor = struct {
+    allocator: std.mem.Allocator,
+    regex: *const Regex,
+    current: std.ArrayListUnmanaged(u32),
+    next: std.ArrayListUnmanaged(u32),
+    groups: []?Match.Group,
+    in_current: []bool,
+
+    fn init(allocator: std.mem.Allocator, regex: *const Regex) !Executor {
+        const groups = try allocator.alloc(?Match.Group, regex.num_groups + 1);
+        @memset(groups, null);
+
+        const in_current = try allocator.alloc(bool, regex.states.len);
+        @memset(in_current, false);
+
+        return .{
+            .allocator = allocator,
+            .regex = regex,
+            .current = .{},
+            .next = .{},
+            .groups = groups,
+            .in_current = in_current,
+        };
+    }
+
+    fn deinit(self: *Executor) void {
+        self.current.deinit(self.allocator);
+        self.next.deinit(self.allocator);
+        self.allocator.free(self.in_current);
+        // groups ownership transferred to Match or freed here
+    }
+
+    fn execute(self: *Executor, text: []const u8, start: usize) !?Match {
+        self.current.clearRetainingCapacity();
+        @memset(self.in_current, false);
+
+        try self.addState(self.regex.start_state, start, text);
+
+        var pos = start;
+        var last_match: ?Match = null;
+
+        while (pos <= text.len) {
+            // Check for match state
+            for (self.current.items) |idx| {
+                if (self.regex.states[idx].type == .match) {
+                    if (!self.regex.anchored_end or pos == text.len) {
+                        // Found a match - save it
+                        const groups_copy = try self.allocator.dupe(?Match.Group, self.groups);
+                        if (last_match) |*m| m.deinit();
+                        last_match = Match{
+                            .start = start,
+                            .end = pos,
+                            .groups = groups_copy,
+                            .allocator = self.allocator,
+                        };
+                    }
+                }
+            }
+
+            if (pos == text.len) break;
+
+            // Process transitions
+            self.next.clearRetainingCapacity();
+            @memset(self.in_current, false);
+
+            const c = text[pos];
+
+            for (self.current.items) |idx| {
+                const state = &self.regex.states[idx];
+                if (self.matchState(state, text, pos, c)) {
+                    if (state.out != State.NONE) {
+                        try self.addStateToNext(state.out, pos + 1, text);
+                    }
+                }
+            }
+
+            // Swap current and next
+            const tmp = self.current;
+            self.current = self.next;
+            self.next = tmp;
+
+            if (self.current.items.len == 0) break;
+            pos += 1;
+        }
+
+        if (last_match) |m| {
+            // Transfer groups ownership
+            self.allocator.free(self.groups);
+            self.groups = @constCast(&[_]?Match.Group{});
+            return m;
+        }
+
+        self.allocator.free(self.groups);
+        self.groups = @constCast(&[_]?Match.Group{});
+        return null;
+    }
+
+    fn matchState(self: *Executor, state: *const State, text: []const u8, pos: usize, c: u8) bool {
+        _ = self;
+        _ = text;
+        _ = pos;
+        switch (state.type) {
+            .literal => {
+                const lit = state.data.literal;
+                if (lit.case_insensitive) {
+                    return simd.toLower(c) == simd.toLower(lit.char);
+                }
+                return c == lit.char;
+            },
+            .char_class => {
+                return state.data.char_class.bitmap.contains(c);
+            },
+            .dot => return c != '\n',
+            .any => return true,
+            // Zero-width assertions are handled in addState/addStateToNext as epsilon transitions
+            else => return false,
+        }
+    }
+
+    fn addState(self: *Executor, idx: u32, pos: usize, text: []const u8) !void {
+        if (idx == State.NONE or idx >= self.regex.states.len) return;
+        if (self.in_current[idx]) return;
+
+        const state = &self.regex.states[idx];
+
+        switch (state.type) {
+            .split => {
+                try self.addState(state.out, pos, text);
+                try self.addState(state.out2, pos, text);
+            },
+            .group_start => {
+                const gidx = state.data.group_idx;
+                if (gidx < self.groups.len) {
+                    self.groups[gidx] = .{ .start = pos, .end = pos };
+                }
+                try self.addState(state.out, pos, text);
+            },
+            .group_end => {
+                const gidx = state.data.group_idx;
+                if (gidx < self.groups.len) {
+                    if (self.groups[gidx]) |*g| {
+                        g.end = pos;
+                    }
+                }
+                try self.addState(state.out, pos, text);
+            },
+            // Zero-width assertions: check condition and follow epsilon transition if satisfied
+            .line_start => {
+                if (pos == 0 or (pos > 0 and text[pos - 1] == '\n')) {
+                    try self.addState(state.out, pos, text);
+                }
+            },
+            .line_end => {
+                if (pos == text.len or (pos < text.len and text[pos] == '\n')) {
+                    try self.addState(state.out, pos, text);
+                }
+            },
+            .word_boundary => {
+                if (simd.isWordBoundary(text, pos)) {
+                    try self.addState(state.out, pos, text);
+                }
+            },
+            .not_word_boundary => {
+                if (!simd.isWordBoundary(text, pos)) {
+                    try self.addState(state.out, pos, text);
+                }
+            },
+            else => {
+                self.in_current[idx] = true;
+                try self.current.append(self.allocator, idx);
+            },
+        }
+    }
+
+    fn addStateToNext(self: *Executor, idx: u32, pos: usize, text: []const u8) !void {
+        if (idx == State.NONE or idx >= self.regex.states.len) return;
+
+        const state = &self.regex.states[idx];
+
+        switch (state.type) {
+            .split => {
+                try self.addStateToNext(state.out, pos, text);
+                try self.addStateToNext(state.out2, pos, text);
+            },
+            .group_start => {
+                const gidx = state.data.group_idx;
+                if (gidx < self.groups.len) {
+                    self.groups[gidx] = .{ .start = pos, .end = pos };
+                }
+                try self.addStateToNext(state.out, pos, text);
+            },
+            .group_end => {
+                const gidx = state.data.group_idx;
+                if (gidx < self.groups.len) {
+                    if (self.groups[gidx]) |*g| {
+                        g.end = pos;
+                    }
+                }
+                try self.addStateToNext(state.out, pos, text);
+            },
+            // Zero-width assertions: check condition and follow epsilon transition if satisfied
+            .line_start => {
+                if (pos == 0 or (pos > 0 and text[pos - 1] == '\n')) {
+                    try self.addStateToNext(state.out, pos, text);
+                }
+            },
+            .line_end => {
+                if (pos == text.len or (pos < text.len and text[pos] == '\n')) {
+                    try self.addStateToNext(state.out, pos, text);
+                }
+            },
+            .word_boundary => {
+                if (simd.isWordBoundary(text, pos)) {
+                    try self.addStateToNext(state.out, pos, text);
+                }
+            },
+            .not_word_boundary => {
+                if (!simd.isWordBoundary(text, pos)) {
+                    try self.addStateToNext(state.out, pos, text);
+                }
+            },
+            else => {
+                // Check for duplicates
+                for (self.next.items) |existing| {
+                    if (existing == idx) return;
+                }
+                try self.next.append(self.allocator, idx);
+            },
+        }
+    }
+};
+
+/// Check if a pattern contains regex metacharacters
+pub fn isRegexPattern(pattern: []const u8) bool {
+    var i: usize = 0;
+    while (i < pattern.len) {
+        const c = pattern[i];
+        switch (c) {
+            '.', '*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '^', '$' => return true,
+            '\\' => {
+                if (i + 1 < pattern.len) {
+                    switch (pattern[i + 1]) {
+                        'd', 'D', 'w', 'W', 's', 'S', 'b', 'B' => return true,
+                        else => {},
+                    }
+                }
+                i += 1;
+            },
+            else => {},
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// Tests
+test "simple literal match" {
+    var regex = try Regex.compile(std.testing.allocator, "hello", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("hello world"));
+    try std.testing.expect(regex.isMatch("say hello"));
+    try std.testing.expect(!regex.isMatch("hell"));
+}
+
+test "dot metacharacter" {
+    var regex = try Regex.compile(std.testing.allocator, "h.llo", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("hello"));
+    try std.testing.expect(regex.isMatch("hallo"));
+    try std.testing.expect(!regex.isMatch("hllo"));
+}
+
+test "character class" {
+    var regex = try Regex.compile(std.testing.allocator, "[abc]", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("a"));
+    try std.testing.expect(regex.isMatch("b"));
+    try std.testing.expect(regex.isMatch("c"));
+    try std.testing.expect(!regex.isMatch("d"));
+}
+
+test "negated character class" {
+    var regex = try Regex.compile(std.testing.allocator, "[^abc]", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(!regex.isMatch("a"));
+    try std.testing.expect(regex.isMatch("d"));
+    try std.testing.expect(regex.isMatch("z"));
+}
+
+test "character range" {
+    var regex = try Regex.compile(std.testing.allocator, "[a-z]+", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("hello"));
+    try std.testing.expect(!regex.isMatch("12345"));
+}
+
+test "kleene star" {
+    var regex = try Regex.compile(std.testing.allocator, "ab*c", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("ac"));
+    try std.testing.expect(regex.isMatch("abc"));
+    try std.testing.expect(regex.isMatch("abbc"));
+    try std.testing.expect(regex.isMatch("abbbc"));
+}
+
+test "plus quantifier" {
+    var regex = try Regex.compile(std.testing.allocator, "ab+c", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(!regex.isMatch("ac"));
+    try std.testing.expect(regex.isMatch("abc"));
+    try std.testing.expect(regex.isMatch("abbc"));
+}
+
+test "optional quantifier" {
+    var regex = try Regex.compile(std.testing.allocator, "colou?r", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("color"));
+    try std.testing.expect(regex.isMatch("colour"));
+}
+
+test "alternation" {
+    var regex = try Regex.compile(std.testing.allocator, "cat|dog", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("cat"));
+    try std.testing.expect(regex.isMatch("dog"));
+    try std.testing.expect(!regex.isMatch("bird"));
+}
+
+test "start anchor" {
+    var regex = try Regex.compile(std.testing.allocator, "^hello", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("hello world"));
+    try std.testing.expect(!regex.isMatch("say hello"));
+}
+
+test "end anchor" {
+    var regex = try Regex.compile(std.testing.allocator, "world$", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("hello world"));
+    try std.testing.expect(!regex.isMatch("world hello"));
+}
+
+test "digit class" {
+    var regex = try Regex.compile(std.testing.allocator, "\\d+", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("123"));
+    try std.testing.expect(regex.isMatch("a123b"));
+    try std.testing.expect(!regex.isMatch("abc"));
+}
+
+test "word class" {
+    var regex = try Regex.compile(std.testing.allocator, "\\w+", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("hello"));
+    try std.testing.expect(regex.isMatch("hello_123"));
+}
+
+test "whitespace class" {
+    var regex = try Regex.compile(std.testing.allocator, "\\s+", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("  "));
+    try std.testing.expect(regex.isMatch("\t\n"));
+    try std.testing.expect(!regex.isMatch("abc"));
+}
+
+test "capture groups" {
+    var regex = try Regex.compile(std.testing.allocator, "(\\w+)@(\\w+)", .{});
+    defer regex.deinit();
+
+    const text = "email: user@domain";
+    var match = (try regex.find(text, std.testing.allocator)).?;
+    defer match.deinit();
+
+    try std.testing.expectEqualStrings("user@domain", match.text(text));
+    try std.testing.expectEqualStrings("user", match.group(1, text).?);
+    try std.testing.expectEqualStrings("domain", match.group(2, text).?);
+}
+
+test "case insensitive" {
+    var regex = try Regex.compile(std.testing.allocator, "hello", .{ .case_insensitive = true });
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("HELLO"));
+    try std.testing.expect(regex.isMatch("Hello"));
+    try std.testing.expect(regex.isMatch("hElLo"));
+}
+
+test "complex pattern" {
+    var regex = try Regex.compile(std.testing.allocator, "[a-zA-Z_][a-zA-Z0-9_]*", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("variable_name"));
+    try std.testing.expect(regex.isMatch("_private"));
+    try std.testing.expect(regex.isMatch("CamelCase"));
+    // "123start" contains "start" which matches the pattern (unanchored)
+    try std.testing.expect(regex.isMatch("123start"));
+    // For full-line matching, use anchors
+    var anchored = try Regex.compile(std.testing.allocator, "^[a-zA-Z_][a-zA-Z0-9_]*$", .{});
+    defer anchored.deinit();
+    try std.testing.expect(!anchored.isMatch("123start"));
+}
+
+test "isRegexPattern" {
+    try std.testing.expect(!isRegexPattern("hello"));
+    try std.testing.expect(isRegexPattern("hello.*"));
+    try std.testing.expect(isRegexPattern("^hello"));
+    try std.testing.expect(isRegexPattern("[a-z]+"));
+    try std.testing.expect(isRegexPattern("a|b"));
+    try std.testing.expect(isRegexPattern("\\d+"));
+}
