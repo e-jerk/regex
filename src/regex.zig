@@ -160,7 +160,7 @@ pub const Regex = struct {
 };
 
 /// State types for the NFA
-const StateType = enum(u8) {
+pub const StateType = enum(u8) {
     literal, // Match single character
     char_class, // Match character class using bitmap
     dot, // Match any character except newline
@@ -175,14 +175,8 @@ const StateType = enum(u8) {
     any, // . including newline (with DOTALL flag)
 };
 
-const State = struct {
-    type: StateType,
-    /// Next state (for non-split states)
-    out: u32,
-    /// Second output for split states
-    out2: u32,
-
-    data: union {
+pub const State = struct {
+    pub const Data = union {
         literal: struct {
             char: u8,
             case_insensitive: bool,
@@ -193,11 +187,18 @@ const State = struct {
         },
         group_idx: u32,
         none: void,
-    },
+    };
 
-    const NONE: u32 = std.math.maxInt(u32);
+    pub const NONE: u32 = std.math.maxInt(u32);
 
-    fn deinit(self: *State, allocator: std.mem.Allocator) void {
+    type: StateType,
+    /// Next state (for non-split states)
+    out: u32,
+    /// Second output for split states
+    out2: u32,
+    data: Data,
+
+    pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         if (self.type == .char_class) {
             allocator.destroy(self.data.char_class.bitmap);
         }
