@@ -173,6 +173,11 @@ pub const StateType = enum(u8) {
     line_start, // ^
     line_end, // $
     any, // . including newline (with DOTALL flag)
+    // PCRE extensions
+    lookahead_pos, // (?=...) positive lookahead
+    lookahead_neg, // (?!...) negative lookahead
+    lookbehind_pos, // (?<=...) positive lookbehind
+    lookbehind_neg, // (?<!...) negative lookbehind
 };
 
 pub const State = struct {
@@ -186,6 +191,11 @@ pub const State = struct {
             negated: bool,
         },
         group_idx: u32,
+        /// For lookahead/lookbehind assertions
+        lookaround: struct {
+            sub_pattern_start: u32, // NFA state index where sub-pattern starts
+            sub_pattern_len: u32, // For lookbehind: fixed length (0 for lookahead)
+        },
         none: void,
     };
 
@@ -401,6 +411,53 @@ const Compiler = struct {
         switch (c) {
             '(' => {
                 self.pos += 1;
+
+                // Check for PCRE extensions: (?=...), (?!...), (?<=...), (?<!...), (?:...)
+                if (self.pos < self.pattern.len and self.pattern[self.pos] == '?') {
+                    self.pos += 1;
+                    if (self.pos >= self.pattern.len) return RegexError.InvalidPattern;
+
+                    const ext_char = self.pattern[self.pos];
+                    switch (ext_char) {
+                        '=' => {
+                            // Positive lookahead (?=...)
+                            self.pos += 1;
+                            return self.parseLookaround(.lookahead_pos);
+                        },
+                        '!' => {
+                            // Negative lookahead (?!...)
+                            self.pos += 1;
+                            return self.parseLookaround(.lookahead_neg);
+                        },
+                        '<' => {
+                            // Lookbehind: (?<=...) or (?<!...)
+                            self.pos += 1;
+                            if (self.pos >= self.pattern.len) return RegexError.InvalidPattern;
+                            const lb_char = self.pattern[self.pos];
+                            if (lb_char == '=') {
+                                self.pos += 1;
+                                return self.parseLookaround(.lookbehind_pos);
+                            } else if (lb_char == '!') {
+                                self.pos += 1;
+                                return self.parseLookaround(.lookbehind_neg);
+                            }
+                            return RegexError.InvalidPattern; // Named groups not supported
+                        },
+                        ':' => {
+                            // Non-capturing group (?:...) - parse like normal group but don't increment group count
+                            self.pos += 1;
+                            const inner = try self.parseExpr();
+                            if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
+                                return RegexError.UnmatchedParen;
+                            }
+                            self.pos += 1;
+                            return inner;
+                        },
+                        else => return RegexError.InvalidPattern,
+                    }
+                }
+
+                // Regular capturing group
                 self.group_count += 1;
                 const group_idx = self.group_count;
 
@@ -784,6 +841,93 @@ const Compiler = struct {
         }
     }
 
+    /// Parse a lookaround assertion: (?=...), (?!...), (?<=...), (?<!...)
+    fn parseLookaround(self: *Compiler, state_type: StateType) Error!u32 {
+        // Record start of sub-pattern states
+        const sub_pattern_start: u32 = @intCast(self.states.items.len);
+
+        // Parse the sub-pattern inside the lookaround
+        const inner = try self.parseExpr();
+
+        if (self.pos >= self.pattern.len or self.pattern[self.pos] != ')') {
+            return RegexError.UnmatchedParen;
+        }
+        self.pos += 1;
+
+        // Add a match state at the end of the sub-pattern (for sub-pattern matching)
+        const sub_match_idx = try self.addState(.{
+            .type = .match,
+            .out = State.NONE,
+            .out2 = State.NONE,
+            .data = .{ .none = {} },
+        });
+        try self.patchEnds(inner, sub_match_idx);
+
+        // For lookbehind, compute the fixed length of the sub-pattern
+        var fixed_length: u32 = 0;
+        if (state_type == .lookbehind_pos or state_type == .lookbehind_neg) {
+            fixed_length = self.computeFixedLength(inner) orelse {
+                // Lookbehind must have fixed length
+                return RegexError.PatternTooComplex;
+            };
+        }
+
+        // Create the lookaround state
+        return self.addState(.{
+            .type = state_type,
+            .out = State.NONE, // Will be patched by caller to continue after assertion
+            .out2 = State.NONE,
+            .data = .{ .lookaround = .{
+                .sub_pattern_start = sub_pattern_start,
+                .sub_pattern_len = fixed_length,
+            } },
+        });
+    }
+
+    /// Compute the fixed length of a sub-pattern for lookbehind
+    /// Returns null if the pattern has variable length (contains *, +, ?, etc.)
+    fn computeFixedLength(self: *Compiler, start_idx: u32) ?u32 {
+        if (start_idx >= self.states.items.len) return 0;
+
+        var length: u32 = 0;
+        var idx = start_idx;
+        var visited = std.AutoHashMap(u32, void).init(self.allocator);
+        defer visited.deinit();
+
+        while (idx < self.states.items.len) {
+            if (visited.get(idx) != null) break;
+            visited.put(idx, {}) catch return null;
+
+            const state = &self.states.items[idx];
+            switch (state.type) {
+                .literal, .char_class, .dot, .any => {
+                    length += 1;
+                    idx = state.out;
+                    if (idx == State.NONE) break;
+                },
+                .split => {
+                    // Variable length - alternation or quantifier
+                    // For alternation, both branches must have same length
+                    const len1 = self.computeFixedLength(state.out);
+                    const len2 = self.computeFixedLength(state.out2);
+                    if (len1 != null and len2 != null and len1.? == len2.?) {
+                        return length + len1.?;
+                    }
+                    return null;
+                },
+                .group_start, .group_end, .line_start, .line_end, .word_boundary, .not_word_boundary => {
+                    // Zero-width - continue
+                    idx = state.out;
+                    if (idx == State.NONE) break;
+                },
+                .match => break,
+                else => return null,
+            }
+        }
+
+        return length;
+    }
+
     fn parseQuantifier(self: *Compiler, base: u32) Error!u32 {
         self.pos += 1; // skip {
 
@@ -1072,6 +1216,38 @@ const Executor = struct {
                     try self.addState(state.out, pos, text);
                 }
             },
+            .lookahead_pos => {
+                // Positive lookahead: continue only if sub-pattern matches at pos
+                const la_data = state.data.lookaround;
+                if (try self.matchSubPattern(text, pos, la_data.sub_pattern_start)) {
+                    try self.addState(state.out, pos, text);
+                }
+            },
+            .lookahead_neg => {
+                // Negative lookahead: continue only if sub-pattern does NOT match at pos
+                const la_data = state.data.lookaround;
+                if (!try self.matchSubPattern(text, pos, la_data.sub_pattern_start)) {
+                    try self.addState(state.out, pos, text);
+                }
+            },
+            .lookbehind_pos => {
+                // Positive lookbehind: continue only if sub-pattern matches ending at pos
+                const lb_data = state.data.lookaround;
+                const len = lb_data.sub_pattern_len;
+                if (pos >= len) {
+                    if (try self.matchSubPatternExact(text, pos - len, lb_data.sub_pattern_start, len)) {
+                        try self.addState(state.out, pos, text);
+                    }
+                }
+            },
+            .lookbehind_neg => {
+                // Negative lookbehind: continue only if sub-pattern does NOT match ending at pos
+                const lb_data = state.data.lookaround;
+                const len = lb_data.sub_pattern_len;
+                if (pos < len or !try self.matchSubPatternExact(text, pos - len, lb_data.sub_pattern_start, len)) {
+                    try self.addState(state.out, pos, text);
+                }
+            },
             else => {
                 self.in_current[idx] = true;
                 try self.current.append(self.allocator, idx);
@@ -1126,12 +1302,188 @@ const Executor = struct {
                     try self.addStateToNext(state.out, pos, text);
                 }
             },
+            .lookahead_pos => {
+                const la_data = state.data.lookaround;
+                if (try self.matchSubPattern(text, pos, la_data.sub_pattern_start)) {
+                    try self.addStateToNext(state.out, pos, text);
+                }
+            },
+            .lookahead_neg => {
+                const la_data = state.data.lookaround;
+                if (!try self.matchSubPattern(text, pos, la_data.sub_pattern_start)) {
+                    try self.addStateToNext(state.out, pos, text);
+                }
+            },
+            .lookbehind_pos => {
+                const lb_data = state.data.lookaround;
+                const len = lb_data.sub_pattern_len;
+                if (pos >= len) {
+                    if (try self.matchSubPatternExact(text, pos - len, lb_data.sub_pattern_start, len)) {
+                        try self.addStateToNext(state.out, pos, text);
+                    }
+                }
+            },
+            .lookbehind_neg => {
+                const lb_data = state.data.lookaround;
+                const len = lb_data.sub_pattern_len;
+                if (pos < len or !try self.matchSubPatternExact(text, pos - len, lb_data.sub_pattern_start, len)) {
+                    try self.addStateToNext(state.out, pos, text);
+                }
+            },
             else => {
                 // Check for duplicates
                 for (self.next.items) |existing| {
                     if (existing == idx) return;
                 }
                 try self.next.append(self.allocator, idx);
+            },
+        }
+    }
+
+    /// Check if sub-pattern matches starting at pos (for lookahead)
+    fn matchSubPattern(self: *Executor, text: []const u8, pos: usize, sub_start: u32) !bool {
+        // Simple recursive sub-pattern matching
+        // We need to check if the sub-pattern can match starting at pos
+        var sub_current: std.ArrayListUnmanaged(u32) = .{};
+        defer sub_current.deinit(self.allocator);
+        var sub_next: std.ArrayListUnmanaged(u32) = .{};
+        defer sub_next.deinit(self.allocator);
+
+        // Initialize with epsilon closure from sub_start
+        try self.addSubState(&sub_current, sub_start, pos, text);
+
+        var sub_pos = pos;
+        while (sub_pos <= text.len) {
+            // Check for match state in sub-pattern
+            for (sub_current.items) |idx| {
+                if (idx < self.regex.states.len and self.regex.states[idx].type == .match) {
+                    return true;
+                }
+            }
+
+            if (sub_pos == text.len) break;
+
+            // Process character transitions
+            sub_next.clearRetainingCapacity();
+            const c = text[sub_pos];
+
+            for (sub_current.items) |idx| {
+                if (idx >= self.regex.states.len) continue;
+                const state = &self.regex.states[idx];
+                if (self.matchState(state, text, sub_pos, c)) {
+                    if (state.out != State.NONE) {
+                        try self.addSubState(&sub_next, state.out, sub_pos + 1, text);
+                    }
+                }
+            }
+
+            const tmp = sub_current;
+            sub_current = sub_next;
+            sub_next = tmp;
+
+            if (sub_current.items.len == 0) break;
+            sub_pos += 1;
+        }
+
+        // Final check for match state
+        for (sub_current.items) |idx| {
+            if (idx < self.regex.states.len and self.regex.states[idx].type == .match) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Check if sub-pattern matches exactly 'len' characters starting at pos (for lookbehind)
+    fn matchSubPatternExact(self: *Executor, text: []const u8, pos: usize, sub_start: u32, len: u32) !bool {
+        if (pos + len > text.len) return false;
+
+        var sub_current: std.ArrayListUnmanaged(u32) = .{};
+        defer sub_current.deinit(self.allocator);
+        var sub_next: std.ArrayListUnmanaged(u32) = .{};
+        defer sub_next.deinit(self.allocator);
+
+        try self.addSubState(&sub_current, sub_start, pos, text);
+
+        var chars_consumed: u32 = 0;
+        var sub_pos = pos;
+
+        while (chars_consumed < len and sub_pos < text.len) {
+            sub_next.clearRetainingCapacity();
+            const c = text[sub_pos];
+
+            for (sub_current.items) |idx| {
+                if (idx >= self.regex.states.len) continue;
+                const state = &self.regex.states[idx];
+                if (self.matchState(state, text, sub_pos, c)) {
+                    if (state.out != State.NONE) {
+                        try self.addSubState(&sub_next, state.out, sub_pos + 1, text);
+                    }
+                }
+            }
+
+            const tmp = sub_current;
+            sub_current = sub_next;
+            sub_next = tmp;
+
+            if (sub_current.items.len == 0) break;
+            sub_pos += 1;
+            chars_consumed += 1;
+        }
+
+        // Check if we consumed exactly len chars and reached match state
+        if (chars_consumed == len) {
+            for (sub_current.items) |idx| {
+                if (idx < self.regex.states.len and self.regex.states[idx].type == .match) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Add state to sub-pattern state list with epsilon closure
+    fn addSubState(self: *Executor, list: *std.ArrayListUnmanaged(u32), idx: u32, pos: usize, text: []const u8) !void {
+        if (idx == State.NONE or idx >= self.regex.states.len) return;
+
+        // Check for duplicates
+        for (list.items) |existing| {
+            if (existing == idx) return;
+        }
+
+        const state = &self.regex.states[idx];
+        switch (state.type) {
+            .split => {
+                try self.addSubState(list, state.out, pos, text);
+                try self.addSubState(list, state.out2, pos, text);
+            },
+            .group_start, .group_end => {
+                try self.addSubState(list, state.out, pos, text);
+            },
+            .line_start => {
+                if (pos == 0 or (pos > 0 and text[pos - 1] == '\n')) {
+                    try self.addSubState(list, state.out, pos, text);
+                }
+            },
+            .line_end => {
+                if (pos == text.len or (pos < text.len and text[pos] == '\n')) {
+                    try self.addSubState(list, state.out, pos, text);
+                }
+            },
+            .word_boundary => {
+                if (simd.isWordBoundary(text, pos)) {
+                    try self.addSubState(list, state.out, pos, text);
+                }
+            },
+            .not_word_boundary => {
+                if (!simd.isWordBoundary(text, pos)) {
+                    try self.addSubState(list, state.out, pos, text);
+                }
+            },
+            else => {
+                try list.append(self.allocator, idx);
             },
         }
     }
@@ -1478,4 +1830,75 @@ test "POSIX: combined with other chars in class" {
 
     try std.testing.expect(regex.isMatch("hello_world"));
     try std.testing.expect(regex.isMatch("_underscore"));
+}
+
+// ============================================================================
+// PCRE Lookaround tests
+// ============================================================================
+
+test "PCRE: positive lookahead (?=...)" {
+    // Match 'foo' only if followed by 'bar'
+    var regex = try Regex.compile(std.testing.allocator, "foo(?=bar)", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("foobar"));
+    try std.testing.expect(!regex.isMatch("foobaz"));
+    try std.testing.expect(!regex.isMatch("foo"));
+}
+
+test "PCRE: negative lookahead (?!...)" {
+    // Match 'foo' only if NOT followed by 'bar'
+    var regex = try Regex.compile(std.testing.allocator, "foo(?!bar)", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(!regex.isMatch("foobar"));
+    try std.testing.expect(regex.isMatch("foobaz"));
+    try std.testing.expect(regex.isMatch("foo"));
+}
+
+test "PCRE: positive lookbehind (?<=...)" {
+    // Match 'bar' only if preceded by 'foo'
+    var regex = try Regex.compile(std.testing.allocator, "(?<=foo)bar", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("foobar"));
+    try std.testing.expect(!regex.isMatch("bazbar"));
+    try std.testing.expect(!regex.isMatch("bar"));
+}
+
+test "PCRE: negative lookbehind (?<!...)" {
+    // Match 'bar' only if NOT preceded by 'foo'
+    var regex = try Regex.compile(std.testing.allocator, "(?<!foo)bar", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(!regex.isMatch("foobar"));
+    try std.testing.expect(regex.isMatch("bazbar"));
+    try std.testing.expect(regex.isMatch("bar"));
+}
+
+test "PCRE: non-capturing group (?:...)" {
+    var regex = try Regex.compile(std.testing.allocator, "(?:foo|bar)baz", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("foobaz"));
+    try std.testing.expect(regex.isMatch("barbaz"));
+    try std.testing.expect(!regex.isMatch("bazbaz"));
+}
+
+test "PCRE: lookahead with character class" {
+    // Match word followed by digit
+    var regex = try Regex.compile(std.testing.allocator, "\\w+(?=\\d)", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("foo1"));
+    try std.testing.expect(!regex.isMatch("foo"));
+}
+
+test "PCRE: lookbehind with digit" {
+    // Match word preceded by digit
+    var regex = try Regex.compile(std.testing.allocator, "(?<=\\d)\\w+", .{});
+    defer regex.deinit();
+
+    try std.testing.expect(regex.isMatch("1foo"));
+    try std.testing.expect(!regex.isMatch("foo"));
 }
