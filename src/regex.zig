@@ -126,7 +126,7 @@ pub const Regex = struct {
 
     /// Find all matches in text
     pub fn findAll(self: *const Regex, text: []const u8, allocator: std.mem.Allocator) ![]Match {
-        var matches: std.ArrayListUnmanaged(Match) = .{};
+        var matches: std.ArrayListUnmanaged(Match) = std.ArrayListUnmanaged(Match).empty;
         errdefer {
             for (matches.items) |*m| m.deinit();
             matches.deinit(allocator);
@@ -232,7 +232,7 @@ const Compiler = struct {
             .pattern = pattern,
             .pos = 0,
             .options = options,
-            .states = .{},
+            .states = std.ArrayListUnmanaged(State).empty,
             .group_count = 0,
         };
     }
@@ -1067,8 +1067,8 @@ const Executor = struct {
         return .{
             .allocator = allocator,
             .regex = regex,
-            .current = .{},
-            .next = .{},
+            .current = std.ArrayListUnmanaged(u32).empty,
+            .next = std.ArrayListUnmanaged(u32).empty,
             .groups = groups,
             .in_current = in_current,
         };
@@ -1344,9 +1344,9 @@ const Executor = struct {
     fn matchSubPattern(self: *Executor, text: []const u8, pos: usize, sub_start: u32) !bool {
         // Simple recursive sub-pattern matching
         // We need to check if the sub-pattern can match starting at pos
-        var sub_current: std.ArrayListUnmanaged(u32) = .{};
+        var sub_current: std.ArrayListUnmanaged(u32) = std.ArrayListUnmanaged(u32).empty;
         defer sub_current.deinit(self.allocator);
-        var sub_next: std.ArrayListUnmanaged(u32) = .{};
+        var sub_next: std.ArrayListUnmanaged(u32) = std.ArrayListUnmanaged(u32).empty;
         defer sub_next.deinit(self.allocator);
 
         // Initialize with epsilon closure from sub_start
@@ -1399,9 +1399,9 @@ const Executor = struct {
     fn matchSubPatternExact(self: *Executor, text: []const u8, pos: usize, sub_start: u32, len: u32) !bool {
         if (pos + len > text.len) return false;
 
-        var sub_current: std.ArrayListUnmanaged(u32) = .{};
+        var sub_current: std.ArrayListUnmanaged(u32) = std.ArrayListUnmanaged(u32).empty;
         defer sub_current.deinit(self.allocator);
-        var sub_next: std.ArrayListUnmanaged(u32) = .{};
+        var sub_next: std.ArrayListUnmanaged(u32) = std.ArrayListUnmanaged(u32).empty;
         defer sub_next.deinit(self.allocator);
 
         try self.addSubState(&sub_current, sub_start, pos, text);
